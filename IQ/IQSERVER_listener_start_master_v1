@@ -1,0 +1,102 @@
+#!/bin/bash
+
+TimeStamp() 
+{ 
+date +'%Y/%m/%d-%H:%M:%S|'
+}
+
+FILENAME=/opt/sybase/scripts/server.ini
+DBPATH=/opt/sybase/servers
+IQSERVER=`basename $0 |sed -e 's/_listener.*//'`
+Interface_file=$SYBASE/interfaces
+#LOGFILE=/opt/sybase/scripts/log/${IQSERVER}_listener_check-`date +'%Y%m%d-%H%M%S'`
+
+for i in `cat $SYBASE/interfaces|grep IQ| xargs`
+do
+	dbping -q -c dsn=${i} > /dev/null 2>&1
+	if [ $? == 0 ];then
+		CORD=$(dbisql -c dsn=${i} "select server_name from sp_iqmpxinfo() where role='coordinator'"|head -3|tail -1)
+		#echo -e "\e[32m$(TimeStamp) $CORD is the Coordinator Server\e[0m" >> $LOGFILE
+		break
+	fi
+done
+
+
+read_line()
+{
+SEARCHSTRING=$1
+L=$2
+ReadLine=`awk 'BEGIN{RS="[";FS="]\n"} $1 ~/('$SEARCHSTRING')/ {print $2}' $FILENAME|sed -n ''${L}p''`
+echo $ReadLine
+}
+
+
+everythinglooksfine()
+{
+	host=$(echo ${LS_Name[$i] ::-5})
+	port=$(echo ${LS_Name[$i]}|tail -c 5)
+	DB_server=$(dbisql -c dsn=$i -host $host -port $port -nogui "select @@servername"|head -3|tail -1)
+	echo -e  "$(TimeStamp) $i logical server is listening to $DB_server" >> $LOGFILE
+}
+
+
+startlistener()
+{
+	echo -e "$(TimeStamp) $i logical server is not listening" >> $LOGFILE
+	IFS=' ' read -r -a ls_members <<< "$LS"
+	echo -e "$(TimeStamp) The members of logical server $i are ${ls_members[@]}" >> $LOGFILE
+	for j in ${ls_members[@]}
+		do
+		dbping -q -c dsn=$j > /dev/null  2>&1
+		if [ $? == 0 ]; then
+			Host=`cat $Interface_file|grep -A1 $j | awk '{print $4}'|tail -1`
+			RGName=$(read_line $i 3)
+			VIPHostName=$(echo ${LS_Name[$i] ::-5})
+			if [ $Host != `ssh -q -o "UserKnownHostsFile=/dev/null" -o "StrictHostKeyChecking=no" sybase@$VIPHostName hostname` ]; then 
+				sudo pcs resource move $RGName $Host > /dev/null  2>&1
+				sudo pcs resource cleanup $RGName > /dev/null  2>&1
+			fi
+			#ssh -o StrictHostKeyChecking=no sybase@$Host >> $LOGFILE
+			echo ${LS_Name[$i]}
+			IP=`ping -c 1 $(read_line $i 1) | egrep PING | awk {'print $3'}|sed 's/(//g;s/)//g'`
+			echo $IP
+			port=$(read_line $i 2)
+			echo $port
+			echo -e "$(TimeStamp) Trying to start logical server $i to listen on $j" >> $LOGFILE
+			dbisql -c dsn=$j -onerror exit "sp_start_listener 'tcpip','$IP:$port'" 
+			if [ $? != 0 ];then dbisql -c dsn=$j -onerror exit "sp_stop_listener 'tcpip','$IP:$port'"; fi
+			nc -zv ${LS_Name[$i]} > /dev/null 2>&1
+			if [ $? == 0 ];then 
+				echo -e "$(TimeStamp) $i is started and now listening to $j" >> $LOGFILE
+				mail -s "$i Listener Restarted" -r dbasupport@sinch.com DI.DBS.DBA.Support@sinch.com <<< "$i listener started and now listening to $j"
+				break
+			else
+				continue
+			fi
+		fi
+	done
+}
+
+
+while [ 1 == 1 ]
+do
+eval declare -A LS_Name=( $(awk 'BEGIN{RS="";FS"\n"} {a1=$1;a2=$2;a3=$3;print $1 "=\"" $2" " $3"\" "}' $FILENAME |tr -d '\n'))
+for i in "${!LS_Name[@]}"
+do
+	LOGFILE=/opt/sybase/scripts/log/${IQSERVER}_listener_check-`date +'%Y%m%d'`
+	if [ "`echo $i|grep RLV`" = "$i" ]; then
+		logical_server=$CORD
+	else
+		logical_server=$(dbisql -c dsn=$CORD -nogui "select server_name from sysiqlsmembers where ls_name='$i'"|grep $IQSERVER|xargs)
+	fi
+	nc -zv ${LS_Name[$i]} > /dev/null 2>&1
+	if [ $? == 0 ]; then
+		ls_members=$logical_server
+		everythinglooksfine >> $LOGFILE
+	else
+		LS=$logical_server
+		startlistener >> $LOGFILE
+	fi
+done
+	sleep 30
+done
